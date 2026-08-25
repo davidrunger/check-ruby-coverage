@@ -1,0 +1,201 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'open3'
+require 'rbconfig'
+require 'tempfile'
+
+class CheckRubyCoverageTest
+  CHECKER_PATH = File.expand_path('../bin/check-ruby-coverage', __dir__)
+  FIXTURE_PATH = File.expand_path('fixtures', __dir__)
+
+  def initialize
+    @failures = []
+  end
+
+  def run
+    test_complete_coverage
+    test_incomplete_coverage
+    test_incomplete_coverage_in_github_actions
+    test_missing_report
+    test_malformed_report
+    test_zero_valid_lines
+    test_invalid_line_totals
+
+    if failures.empty?
+      puts('7 tests passed.')
+      return 0
+    end
+
+    warn("#{failures.length} test(s) failed:")
+    failures.each { warn("- #{it}") }
+    1
+  end
+
+  private
+
+  attr_reader :failures
+
+  def test_complete_coverage
+    result = run_checker(fixture('complete.xml'))
+
+    assert('complete coverage exits successfully') { result[:status].success? }
+    assert_equal(
+      'complete coverage stdout',
+      "Line coverage is 100% (3/3 lines covered).\n",
+      result[:stdout],
+    )
+    assert_equal('complete coverage stderr', '', result[:stderr])
+    assert_equal('complete coverage summary', '', result[:summary])
+  end
+
+  def test_incomplete_coverage
+    result = run_checker(fixture('incomplete.xml'))
+
+    assert('incomplete coverage exits unsuccessfully') { !result[:status].success? }
+    assert_equal('incomplete coverage stdout', '', result[:stdout])
+    assert_equal(
+      'incomplete coverage stderr',
+      <<~OUTPUT,
+        Uncovered lines:
+        app/poros/first_example.rb:2
+        app/poros/first_example.rb:8
+        app/poros/second_example.rb:4
+        Line coverage is not 100% (4/7 lines covered).
+      OUTPUT
+      result[:stderr],
+    )
+    assert_equal(
+      'incomplete coverage summary',
+      <<~SUMMARY,
+        ## Ruby coverage check failed
+
+        Line coverage is not 100% (4/7 lines covered).
+
+        ### Uncovered lines
+
+        ```text
+        app/poros/first_example.rb:2
+        app/poros/first_example.rb:8
+        app/poros/second_example.rb:4
+        ```
+      SUMMARY
+      result[:summary],
+    )
+  end
+
+  def test_missing_report
+    result = run_checker('/missing/coverage.xml')
+
+    assert('missing report exits unsuccessfully') { !result[:status].success? }
+    assert_equal(
+      'missing report stderr',
+      "Coverage report not found at /missing/coverage.xml.\n",
+      result[:stderr],
+    )
+    assert('missing report writes a summary') do
+      result[:summary].include?('Coverage report not found at /missing/coverage.xml.')
+    end
+  end
+
+  def test_incomplete_coverage_in_github_actions
+    result = run_checker(fixture('incomplete.xml'), github_actions: true)
+    stderr_lines = result[:stderr].lines
+    stop_command = stderr_lines.first.match(/\A::stop-commands::(?<token>check-ruby-coverage-[0-9a-f]{32})\n\z/)
+
+    assert('GitHub Actions output starts by stopping workflow commands') { !stop_command.nil? }
+    return if stop_command.nil?
+
+    assert_equal(
+      'GitHub Actions output resumes workflow commands after uncovered lines',
+      "::#{stop_command[:token]}::\n",
+      stderr_lines[-2],
+    )
+    assert_equal(
+      'GitHub Actions output reports the coverage failure after resuming workflow commands',
+      "Line coverage is not 100% (4/7 lines covered).\n",
+      stderr_lines.last,
+    )
+  end
+
+  def test_malformed_report
+    with_report('<coverage') do |report_path|
+      result = run_checker(report_path)
+
+      assert('malformed report exits unsuccessfully') { !result[:status].success? }
+      assert('malformed report explains the failure') do
+        result[:stderr].start_with?("Invalid coverage report at #{report_path}:")
+      end
+      assert('malformed report writes a summary') do
+        result[:summary].include?("Invalid coverage report at #{report_path}:")
+      end
+    end
+  end
+
+  def test_zero_valid_lines
+    with_report('<coverage lines-covered="0" lines-valid="0"><packages/></coverage>') do |report_path|
+      result = run_checker(report_path)
+
+      assert('zero valid lines exits unsuccessfully') { !result[:status].success? }
+      assert_equal(
+        'zero valid lines stderr',
+        "Coverage report contains zero valid lines.\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def test_invalid_line_totals
+    with_report('<coverage lines-covered="4" lines-valid="3"><packages/></coverage>') do |report_path|
+      result = run_checker(report_path)
+
+      assert('invalid line totals exit unsuccessfully') { !result[:status].success? }
+      assert_equal(
+        'invalid line totals stderr',
+        "Coverage report has invalid line totals (4/3 lines covered).\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def run_checker(coverage_report_path, github_actions: false)
+    Tempfile.create('github-step-summary') do |summary|
+      stdout, stderr, status = Open3.capture3(
+        {
+          'GITHUB_ACTIONS' => github_actions ? 'true' : nil,
+          'GITHUB_STEP_SUMMARY' => summary.path,
+        },
+        RbConfig.ruby,
+        CHECKER_PATH,
+        coverage_report_path,
+      )
+      summary.rewind
+
+      return { stdout:, stderr:, status:, summary: summary.read }
+    end
+  end
+
+  def with_report(contents)
+    Tempfile.create(['coverage', '.xml']) do |report|
+      report.write(contents)
+      report.flush
+      yield(report.path)
+    end
+  end
+
+  def fixture(filename)
+    File.join(FIXTURE_PATH, filename)
+  end
+
+  def assert(label)
+    failures << label if !yield
+  end
+
+  def assert_equal(label, expected, actual)
+    return if expected == actual
+
+    failures << "#{label}: expected #{expected.inspect}, got #{actual.inspect}"
+  end
+end
+
+exit(CheckRubyCoverageTest.new.run)

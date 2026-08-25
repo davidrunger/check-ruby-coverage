@@ -1,0 +1,330 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'date'
+require 'fileutils'
+require 'open3'
+require 'rbconfig'
+require 'tmpdir'
+
+class ReleaseTest
+  PREPARE_RELEASE_PATH = File.expand_path('../bin/prepare-release', __dir__)
+  RELEASE_NOTES_PATH = File.expand_path('../bin/release-notes', __dir__)
+
+  def initialize
+    @failures = []
+  end
+
+  def run
+    test_prepares_first_major_release
+    test_prepares_minor_release
+    test_prepares_patch_release
+    test_rejects_dirty_repository
+    test_rejects_invalid_release_type
+    test_rejects_non_main_branch
+    test_rejects_outdated_main
+    test_rejects_empty_unreleased_section
+    test_rejects_inconsistent_current_version
+    test_prints_release_notes
+    test_rejects_unreleased_changes_when_publishing
+    test_rejects_inconsistent_release_version
+
+    if failures.empty?
+      puts('12 tests passed.')
+      return 0
+    end
+
+    warn("#{failures.length} test(s) failed:")
+    failures.each { warn("- #{it}") }
+    1
+  end
+
+  private
+
+  attr_reader :failures
+
+  def test_prepares_first_major_release
+    with_repository(version: '0.0.0', changelog: unreleased_changelog) do |repository_path|
+      result = run_script(repository_path, 'prepare-release', 'major')
+
+      assert("first major release succeeds: #{result[:stderr].strip}") { result[:status].success? }
+      assert_equal('first major release version', "1.0.0\n", read(repository_path, 'VERSION'))
+      assert_equal(
+        'first major release changelog',
+        <<~CHANGELOG,
+          # Changelog
+
+          ## Unreleased
+
+          ## v1.0.0 (#{Date.today})
+
+          - Add the initial action.
+        CHANGELOG
+        read(repository_path, 'CHANGELOG.md'),
+      )
+      assert_equal(
+        'first major release commit message',
+        "[release] Prepare to release v1.0.0\n\n" \
+          "Update `VERSION` to 1.0.0 and archive the `Unreleased` entries in `CHANGELOG.md`.\n\n",
+        git(repository_path, 'show', '-s', '--format=%B', 'HEAD'),
+      )
+      assert_equal(
+        'first major release committed files',
+        "CHANGELOG.md\nVERSION\n",
+        git(repository_path, 'show', '--format=', '--name-only', 'HEAD'),
+      )
+      assert_equal('first major release repository status', '', git(repository_path, 'status', '--porcelain'))
+      assert_equal(
+        'first major release branch',
+        "release/v1.0.0\n",
+        git(repository_path, 'branch', '--show-current'),
+      )
+      assert_equal(
+        'first major release branch upstream',
+        "origin/main\n",
+        git(repository_path, 'rev-parse', '--abbrev-ref', '@{upstream}'),
+      )
+    end
+  end
+
+  def test_prepares_patch_release
+    changelog = <<~CHANGELOG
+      # Changelog
+
+      ## Unreleased
+
+      - Fix report parsing.
+
+      ## v1.2.3 (2026-08-01)
+
+      - Add the initial action.
+    CHANGELOG
+
+    with_repository(version: '1.2.3', changelog:) do |repository_path|
+      result = run_script(repository_path, 'prepare-release', 'patch')
+
+      assert("patch release succeeds: #{result[:stderr].strip}") { result[:status].success? }
+      assert_equal('patch release version', "1.2.4\n", read(repository_path, 'VERSION'))
+      assert('patch release preserves older releases') do
+        read(repository_path, 'CHANGELOG.md').include?('## v1.2.3 (2026-08-01)')
+      end
+    end
+  end
+
+  def test_prepares_minor_release
+    with_repository(version: '1.2.3', changelog: changelog_since(version: '1.2.3')) do |repository_path|
+      result = run_script(repository_path, 'prepare-release', 'minor')
+
+      assert("minor release succeeds: #{result[:stderr].strip}") { result[:status].success? }
+      assert_equal('minor release version', "1.3.0\n", read(repository_path, 'VERSION'))
+    end
+  end
+
+  def test_rejects_invalid_release_type
+    with_repository(version: '1.2.3', changelog: changelog_since(version: '1.2.3')) do |repository_path|
+      result = run_script(repository_path, 'prepare-release', 'banana')
+
+      assert('invalid release type fails preparation') { !result[:status].success? }
+      assert_equal(
+        'invalid release type error',
+        "Usage: bin/prepare-release major|minor|patch\n",
+        result[:stderr],
+      )
+      assert_equal('invalid release type preserves version', "1.2.3\n", read(repository_path, 'VERSION'))
+      assert_equal(
+        'invalid release type preserves changelog',
+        changelog_since(version: '1.2.3'),
+        read(repository_path, 'CHANGELOG.md'),
+      )
+    end
+  end
+
+  def test_rejects_dirty_repository
+    with_repository(version: '1.2.3', changelog: changelog_since(version: '1.2.3')) do |repository_path|
+      File.write(File.join(repository_path, 'uncommitted-file'), "uncommitted\n")
+      result = run_script(repository_path, 'prepare-release', 'patch')
+
+      assert('dirty repository fails preparation') { !result[:status].success? }
+      assert_equal(
+        'dirty repository error',
+        "Commit or discard existing changes before preparing a release.\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def test_rejects_non_main_branch
+    with_repository(version: '1.2.3', changelog: changelog_since(version: '1.2.3')) do |repository_path|
+      git(repository_path, 'switch', '-c', 'feature/test')
+      result = run_script(repository_path, 'prepare-release', 'patch')
+
+      assert('non-main branch fails preparation') { !result[:status].success? }
+      assert_equal(
+        'non-main branch error',
+        "Run bin/prepare-release from the main branch.\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def test_rejects_outdated_main
+    with_repository(version: '1.2.3', changelog: changelog_since(version: '1.2.3')) do |repository_path|
+      File.write(File.join(repository_path, 'new-file'), "new\n")
+      git(repository_path, 'add', 'new-file')
+      git(repository_path, 'commit', '-m', 'Advance local main')
+      result = run_script(repository_path, 'prepare-release', 'patch')
+
+      assert('outdated main fails preparation') { !result[:status].success? }
+      assert_equal(
+        'outdated main error',
+        "Update main so that it matches origin/main before preparing a release.\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def test_rejects_empty_unreleased_section
+    with_repository(version: '1.0.0', changelog: released_changelog) do |repository_path|
+      result = run_script(repository_path, 'prepare-release', 'patch')
+
+      assert('empty unreleased section fails preparation') { !result[:status].success? }
+      assert_equal(
+        'empty unreleased section error',
+        "The Unreleased changelog section is empty.\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def test_rejects_inconsistent_current_version
+    with_repository(version: '1.0.1', changelog: released_changelog) do |repository_path|
+      result = run_script(repository_path, 'prepare-release', 'patch')
+
+      assert('inconsistent version fails preparation') { !result[:status].success? }
+      assert('inconsistent version explains preparation failure') do
+        result[:stderr].include?('the newest released changelog version is 1.0.0')
+      end
+    end
+  end
+
+  def test_prints_release_notes
+    with_repository(version: '1.0.0', changelog: released_changelog) do |repository_path|
+      result = run_script(repository_path, 'release-notes')
+
+      assert("valid release notes succeed: #{result[:stderr].strip}") { result[:status].success? }
+      assert_equal('release notes output', "- Add the initial action.\n", result[:stdout])
+    end
+  end
+
+  def test_rejects_unreleased_changes_when_publishing
+    changelog = released_changelog.sub("## Unreleased\n", "## Unreleased\n\n- Add another change.\n")
+
+    with_repository(version: '1.0.0', changelog:) do |repository_path|
+      result = run_script(repository_path, 'release-notes')
+
+      assert('unreleased changes fail publication') { !result[:status].success? }
+      assert_equal(
+        'unreleased changes publication error',
+        "The Unreleased changelog section must be empty before publishing.\n",
+        result[:stderr],
+      )
+    end
+  end
+
+  def test_rejects_inconsistent_release_version
+    with_repository(version: '1.0.1', changelog: released_changelog) do |repository_path|
+      result = run_script(repository_path, 'release-notes')
+
+      assert('inconsistent version fails publication') { !result[:status].success? }
+      assert('inconsistent version explains publication failure') do
+        result[:stderr].include?('the newest released changelog version is 1.0.0')
+      end
+    end
+  end
+
+  def with_repository(version:, changelog:)
+    Dir.mktmpdir('check-ruby-coverage-release-test') do |repository_path|
+      FileUtils.mkdir_p(File.join(repository_path, 'bin'))
+      FileUtils.cp(PREPARE_RELEASE_PATH, File.join(repository_path, 'bin'))
+      FileUtils.cp(RELEASE_NOTES_PATH, File.join(repository_path, 'bin'))
+      File.write(File.join(repository_path, 'VERSION'), "#{version}\n")
+      File.write(File.join(repository_path, 'CHANGELOG.md'), changelog)
+      git(repository_path, 'init', '--initial-branch=main')
+      git(repository_path, 'config', 'user.email', 'release-test@example.com')
+      git(repository_path, 'config', 'user.name', 'Release Test')
+      git(repository_path, 'add', '.')
+      git(repository_path, 'commit', '-m', 'Initial test state')
+      git(repository_path, 'remote', 'add', 'origin', repository_path)
+      git(repository_path, 'update-ref', 'refs/remotes/origin/main', 'HEAD')
+      yield(repository_path)
+    end
+  end
+
+  def git(repository_path, *arguments)
+    stdout, stderr, status = Open3.capture3('git', *arguments, chdir: repository_path)
+    raise "Git failed: #{stderr}" if !status.success?
+
+    stdout
+  end
+
+  def run_script(repository_path, script, *arguments)
+    stdout, stderr, status = Open3.capture3(
+      RbConfig.ruby,
+      File.join(repository_path, 'bin', script),
+      *arguments,
+    )
+    { stdout:, stderr:, status: }
+  end
+
+  def read(repository_path, filename)
+    File.read(File.join(repository_path, filename))
+  end
+
+  def unreleased_changelog
+    <<~CHANGELOG
+      # Changelog
+
+      ## Unreleased
+
+      - Add the initial action.
+    CHANGELOG
+  end
+
+  def released_changelog
+    <<~CHANGELOG
+      # Changelog
+
+      ## Unreleased
+
+      ## v1.0.0 (2026-08-01)
+
+      - Add the initial action.
+    CHANGELOG
+  end
+
+  def changelog_since(version:)
+    <<~CHANGELOG
+      # Changelog
+
+      ## Unreleased
+
+      - Fix report parsing.
+
+      ## v#{version} (2026-08-01)
+
+      - Add the initial action.
+    CHANGELOG
+  end
+
+  def assert(label)
+    failures << label if !yield
+  end
+
+  def assert_equal(label, expected, actual)
+    return if expected == actual
+
+    failures << "#{label}: expected #{expected.inspect}, got #{actual.inspect}"
+  end
+end
+
+exit(ReleaseTest.new.run)

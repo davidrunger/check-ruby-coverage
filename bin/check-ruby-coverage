@@ -1,0 +1,166 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'securerandom'
+
+begin
+  require 'rexml/document'
+rescue LoadError
+  abort('Check Ruby Coverage requires the rexml gem. Install rexml before running the action.')
+end
+
+class CheckRubyCoverage
+  class InvalidReport < StandardError; end
+
+  def initialize(coverage_report_path:, stdout: $stdout, stderr: $stderr)
+    @coverage_report_path = coverage_report_path
+    @stdout = stdout
+    @stderr = stderr
+  end
+
+  def run
+    if !File.file?(coverage_report_path)
+      return fail_with("Coverage report not found at #{coverage_report_path}.")
+    end
+
+    coverage = coverage_element
+    covered_lines = integer_attribute(coverage, 'lines-covered')
+    valid_lines = integer_attribute(coverage, 'lines-valid')
+
+    if valid_lines.zero?
+      return fail_with('Coverage report contains zero valid lines.')
+    end
+
+    if valid_lines.negative? || covered_lines.negative? || covered_lines > valid_lines
+      return fail_with(
+        "Coverage report has invalid line totals (#{covered_lines}/#{valid_lines} lines covered).",
+      )
+    end
+
+    if covered_lines == valid_lines
+      stdout.puts("Line coverage is 100% (#{covered_lines}/#{valid_lines} lines covered).")
+      return 0
+    end
+
+    uncovered_lines = uncovered_lines(coverage)
+    message = "Line coverage is not 100% (#{covered_lines}/#{valid_lines} lines covered)."
+
+    print_uncovered_lines(uncovered_lines)
+    fail_with(message, uncovered_lines:)
+  rescue InvalidReport, REXML::ParseException => error
+    fail_with("Invalid coverage report at #{coverage_report_path}: #{single_line(error.message)}")
+  end
+
+  private
+
+  attr_reader :coverage_report_path, :stderr, :stdout
+
+  def coverage_element
+    coverage = REXML::Document.new(File.read(coverage_report_path)).root
+
+    if coverage&.name != 'coverage'
+      raise InvalidReport, 'root element must be <coverage>'
+    end
+
+    coverage
+  rescue Errno::EACCES, Errno::EISDIR => error
+    raise InvalidReport, error.message
+  end
+
+  def integer_attribute(element, name)
+    raw_value = element.attributes[name]
+    raise InvalidReport, "<#{element.name}> is missing the #{name.inspect} attribute" if raw_value.nil?
+
+    Integer(raw_value)
+  rescue ArgumentError
+    raise InvalidReport, "<#{element.name}> has a non-integer #{name.inspect} attribute"
+  end
+
+  def uncovered_lines(coverage)
+    uncovered_lines = []
+
+    coverage.each_element('packages/package/classes/class') do |coverage_class|
+      filename = coverage_class.attributes['filename']
+      raise InvalidReport, '<class> is missing the "filename" attribute' if filename.nil? || filename.empty?
+      raise InvalidReport, '<class> filename contains a line break' if filename.match?(/[\r\n]/)
+
+      coverage_class.each_element('lines/line') do |line|
+        hits = integer_attribute(line, 'hits')
+        raise InvalidReport, '<line> has negative hits' if hits.negative?
+
+        next if hits.positive?
+
+        line_number = integer_attribute(line, 'number')
+        raise InvalidReport, '<line> has a non-positive line number' if !line_number.positive?
+
+        uncovered_lines << "#{filename}:#{line_number}"
+      end
+    end
+
+    uncovered_lines.uniq.sort
+  end
+
+  def print_uncovered_lines(uncovered_lines)
+    return if uncovered_lines.empty?
+
+    workflow_command_token = stop_workflow_commands
+    stderr.puts('Uncovered lines:')
+    uncovered_lines.each { stderr.puts(it) }
+  ensure
+    resume_workflow_commands(workflow_command_token)
+  end
+
+  def stop_workflow_commands
+    return if ENV['GITHUB_ACTIONS'] != 'true'
+
+    token = "check-ruby-coverage-#{SecureRandom.hex(16)}"
+    stderr.puts("::stop-commands::#{token}")
+    token
+  end
+
+  def resume_workflow_commands(token)
+    stderr.puts("::#{token}::") if token
+  end
+
+  def fail_with(message, uncovered_lines: [])
+    stderr.puts(message)
+    write_failure_summary(message, uncovered_lines)
+    1
+  end
+
+  def write_failure_summary(message, uncovered_lines)
+    summary_path = ENV.fetch('GITHUB_STEP_SUMMARY', nil)
+    return if summary_path.nil? || summary_path.empty?
+
+    File.open(summary_path, 'a') do |summary|
+      summary.puts('## Ruby coverage check failed')
+      summary.puts
+      summary.puts(message)
+
+      if uncovered_lines.any?
+        summary.puts
+        summary.puts('### Uncovered lines')
+        summary.puts
+        write_code_block(summary, uncovered_lines)
+      end
+    end
+  rescue SystemCallError => error
+    stderr.puts("Could not write the job summary: #{single_line(error.message)}")
+  end
+
+  def write_code_block(summary, lines)
+    longest_backtick_run = lines.flat_map { it.scan(/`+/) }.map(&:length).max || 0
+    fence = '`' * [3, longest_backtick_run + 1].max
+
+    summary.puts("#{fence}text")
+    lines.each { summary.puts(it) }
+    summary.puts(fence)
+  end
+
+  def single_line(message)
+    message.to_s.gsub(/[\r\n]+/, ' ').strip
+  end
+end
+
+coverage_report_path = ARGV.fetch(0, 'tmp/simple_cov/coverage.xml')
+exit(CheckRubyCoverage.new(coverage_report_path:).run)

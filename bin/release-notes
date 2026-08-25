@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+class ReleaseNotes
+  CHANGELOG_FILENAME = 'CHANGELOG.md'
+  VERSION_FILENAME = 'VERSION'
+  VERSION_PATTERN = /\A\d+\.\d+\.\d+\z/
+
+  def initialize(root_path:, stdout: $stdout)
+    @root_path = root_path
+    @stdout = stdout
+  end
+
+  def run
+    version = current_version
+    verify_unreleased_section_is_empty
+    notes = notes_for(version)
+
+    stdout.puts(notes)
+    0
+  rescue ArgumentError => error
+    abort(error.message)
+  end
+
+  private
+
+  attr_reader :root_path, :stdout
+
+  def current_version
+    version = File.read(version_path).strip
+    raise ArgumentError, "Invalid version in #{VERSION_FILENAME}: #{version.inspect}." if !version.match?(VERSION_PATTERN)
+    raise ArgumentError, "#{VERSION_FILENAME} must be released from 0.0.0 before publishing." if version == '0.0.0'
+
+    version
+  rescue Errno::ENOENT
+    raise ArgumentError, "#{VERSION_FILENAME} does not exist."
+  end
+
+  def verify_unreleased_section_is_empty
+    match = changelog.match(/^## Unreleased\s*\n(?<notes>.*?)(?=^## |\z)/m)
+    raise ArgumentError, "#{CHANGELOG_FILENAME} does not contain an Unreleased section." if match.nil?
+    return if match[:notes].strip.empty?
+
+    raise ArgumentError, 'The Unreleased changelog section must be empty before publishing.'
+  end
+
+  def notes_for(version)
+    released_versions = changelog.scan(/^## v(\d+\.\d+\.\d+) \(\d{4}-\d{2}-\d{2}\)$/).flatten
+    newest_version = released_versions.first
+
+    if newest_version != version
+      raise ArgumentError,
+            "#{VERSION_FILENAME} contains #{version}, but the newest released changelog version is #{newest_version || 'missing'}."
+    end
+
+    match = changelog.match(/^## v#{Regexp.escape(version)} \(\d{4}-\d{2}-\d{2}\)\s*\n(?<notes>.*?)(?=^## |\z)/m)
+    notes = match[:notes].strip
+    raise ArgumentError, "The changelog entry for v#{version} is empty." if notes.empty?
+
+    notes
+  end
+
+  def changelog
+    @changelog ||= File.read(changelog_path)
+  rescue Errno::ENOENT
+    raise ArgumentError, "#{CHANGELOG_FILENAME} does not exist."
+  end
+
+  def changelog_path
+    File.join(root_path, CHANGELOG_FILENAME)
+  end
+
+  def version_path
+    File.join(root_path, VERSION_FILENAME)
+  end
+end
+
+root_path = File.expand_path('..', __dir__)
+exit(ReleaseNotes.new(root_path:).run)

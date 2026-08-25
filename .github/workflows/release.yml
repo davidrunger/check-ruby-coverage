@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Require main
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Release the main branch, not $GITHUB_REF." >&2
+            exit 1
+          fi
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+
+      - name: Run coverage checker tests
+        run: ruby test/check-ruby-coverage
+
+      - name: Run release tests
+        run: ruby test/release
+
+      - name: Check a complete report with the action
+        uses: ./
+        with:
+          coverage-file: test/fixtures/complete.xml
+
+      - name: Read release metadata
+        id: release
+        shell: bash
+        run: |
+          version="$(tr -d '\n' < VERSION)"
+
+          if [[ "$version" == "0.0.0" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "VERSION is 0.0.0; no release will be published."
+            exit 0
+          fi
+
+          ruby bin/release-notes > "$RUNNER_TEMP/release-notes.md"
+
+          major="${version%%.*}"
+          version_without_major="${version#*.}"
+          minor="${version_without_major%%.*}"
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "release-tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "major-tag=v$major" >> "$GITHUB_OUTPUT"
+          echo "minor-tag=v$major.$minor" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize unreleased version
+        if: steps.release.outputs.publish == 'false'
+        shell: bash
+        run: |
+          {
+            echo "## No release published"
+            echo
+            echo "VERSION is \`0.0.0\`, which marks an unreleased repository."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish tags
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          MAJOR_TAG: ${{ steps.release.outputs.major-tag }}
+          MINOR_TAG: ${{ steps.release.outputs.minor-tag }}
+          RELEASE_TAG: ${{ steps.release.outputs.release-tag }}
+        run: |
+          git fetch --force origin 'refs/tags/*:refs/tags/*'
+
+          existing_release_sha="$(git rev-list -n 1 "$RELEASE_TAG" 2>/dev/null || true)"
+          if [[ -n "$existing_release_sha" && "$existing_release_sha" != "$GITHUB_SHA" ]]; then
+            echo "$RELEASE_TAG already points to $existing_release_sha, not $GITHUB_SHA." >&2
+            exit 1
+          fi
+
+          git tag --force "$MAJOR_TAG" "$GITHUB_SHA"
+          git tag --force "$MINOR_TAG" "$GITHUB_SHA"
+
+          if [[ -n "$existing_release_sha" ]]; then
+            git push --atomic origin \
+              "+refs/tags/$MAJOR_TAG:refs/tags/$MAJOR_TAG" \
+              "+refs/tags/$MINOR_TAG:refs/tags/$MINOR_TAG"
+          else
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+            git push --atomic origin \
+              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" \
+              "+refs/tags/$MAJOR_TAG:refs/tags/$MAJOR_TAG" \
+              "+refs/tags/$MINOR_TAG:refs/tags/$MINOR_TAG"
+          fi
+
+      - name: Publish GitHub Release
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.release-tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists; leaving it unchanged."
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "$RELEASE_TAG" \
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              --verify-tag
+          fi
+
+      - name: Summarize release
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAJOR_TAG: ${{ steps.release.outputs.major-tag }}
+          MINOR_TAG: ${{ steps.release.outputs.minor-tag }}
+          RELEASE_TAG: ${{ steps.release.outputs.release-tag }}
+        run: |
+          release_url="$(gh release view "$RELEASE_TAG" --json url --jq .url)"
+          {
+            echo "## Released $RELEASE_TAG"
+            echo
+            echo "- Release: [$release_url]($release_url)"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Compatibility tags: \`$MAJOR_TAG\`, \`$MINOR_TAG\`"
+            echo
+            echo "Pin this release with:"
+            echo
+            echo '```yaml'
+            echo "uses: davidrunger/check-ruby-coverage@$GITHUB_SHA # $RELEASE_TAG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
