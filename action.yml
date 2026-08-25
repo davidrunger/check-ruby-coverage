@@ -1,0 +1,18 @@
+name: Check Ruby Coverage
+description: Fail unless a Cobertura report shows 100% Ruby line coverage
+
+inputs:
+  coverage-file:
+    description: Path to the Cobertura XML coverage report
+    required: false
+    default: tmp/simple_cov/coverage.xml
+
+runs:
+  using: composite
+  steps:
+    - name: Check line coverage
+      shell: bash
+      env:
+        CHECK_RUBY_COVERAGE_ACTION_PATH: ${{ github.action_path }}
+        COVERAGE_FILE: ${{ inputs.coverage-file }}
+      run: ruby "$CHECK_RUBY_COVERAGE_ACTION_PATH/bin/check-ruby-coverage" "$COVERAGE_FILE"

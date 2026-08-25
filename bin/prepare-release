@@ -1,0 +1,171 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Prepare the next semantic release:
+#
+#   bin/prepare-release major  # 1.2.3 -> 2.0.0
+#   bin/prepare-release minor  # 1.2.3 -> 1.3.0
+#   bin/prepare-release patch  # 1.2.3 -> 1.2.4
+#
+# Run the script from a clean, up-to-date main branch. It creates a release
+# branch named release/vX.Y.Z, updates VERSION, moves the CHANGELOG.md
+# Unreleased notes into a dated section for the new version, creates a fresh
+# Unreleased section, and commits those two files.
+
+require 'date'
+require 'open3'
+
+class PrepareRelease
+  CHANGELOG_FILENAME = 'CHANGELOG.md'
+  VERSION_FILENAME = 'VERSION'
+  VERSION_PATTERN = /\A(\d+)\.(\d+)\.(\d+)\z/
+
+  def initialize(root_path:, release_type:, date: Date.today, stdout: $stdout)
+    @root_path = root_path
+    @release_type = release_type
+    @date = date
+    @stdout = stdout
+  end
+
+  def run
+    verify_release_type
+    verify_git_state
+    version = current_version
+    verify_changelog_version(version)
+    notes = unreleased_notes
+    next_version = incremented_version(version)
+
+    create_release_branch(next_version)
+    File.write(version_path, "#{next_version}\n")
+    File.write(changelog_path, released_changelog(next_version, notes))
+    commit_release(next_version)
+    stdout.puts("Prepared and committed v#{next_version} for release.")
+    0
+  rescue ArgumentError => error
+    abort(error.message)
+  end
+
+  private
+
+  attr_reader :date, :release_type, :root_path, :stdout
+
+  def verify_release_type
+    return if %w[major minor patch].include?(release_type)
+
+    raise ArgumentError, 'Usage: bin/prepare-release major|minor|patch'
+  end
+
+  def verify_git_state
+    inside_worktree = git_output('rev-parse', '--is-inside-work-tree', allow_failure: true).strip
+    raise ArgumentError, 'Run bin/prepare-release from a Git worktree.' if inside_worktree != 'true'
+
+    branch = git_output('branch', '--show-current').strip
+    raise ArgumentError, 'Run bin/prepare-release from the main branch.' if branch != 'main'
+
+    status = git_output('status', '--porcelain')
+    raise ArgumentError, 'Commit or discard existing changes before preparing a release.' if !status.empty?
+
+    verify_main_matches_origin
+  end
+
+  def verify_main_matches_origin
+    origin_main = git_output('rev-parse', '--verify', 'origin/main', allow_failure: true).strip
+    return if origin_main.empty? || origin_main == git_output('rev-parse', 'HEAD').strip
+
+    raise ArgumentError, 'Update main so that it matches origin/main before preparing a release.'
+  end
+
+  def current_version
+    version = File.read(version_path).strip
+    raise ArgumentError, "Invalid version in #{VERSION_FILENAME}: #{version.inspect}." if !version.match?(VERSION_PATTERN)
+
+    version
+  rescue Errno::ENOENT
+    raise ArgumentError, "#{VERSION_FILENAME} does not exist."
+  end
+
+  def verify_changelog_version(version)
+    released_versions = changelog.scan(/^## v(\d+\.\d+\.\d+) \(\d{4}-\d{2}-\d{2}\)$/).flatten
+    expected_version = released_versions.first || '0.0.0'
+    return if version == expected_version
+
+    raise ArgumentError,
+          "#{VERSION_FILENAME} contains #{version}, but the newest released changelog version is #{expected_version}."
+  end
+
+  def unreleased_notes
+    match = changelog.match(/^## Unreleased\s*\n(?<notes>.*?)(?=^## |\z)/m)
+    raise ArgumentError, "#{CHANGELOG_FILENAME} does not contain an Unreleased section." if match.nil?
+
+    notes = match[:notes].strip
+    raise ArgumentError, 'The Unreleased changelog section is empty.' if notes.empty?
+
+    notes
+  end
+
+  def incremented_version(version)
+    major, minor, patch = VERSION_PATTERN.match(version).captures.map(&:to_i)
+
+    case release_type
+    when 'major' then [major + 1, 0, 0]
+    when 'minor' then [major, minor + 1, 0]
+    when 'patch' then [major, minor, patch + 1]
+    end.join('.')
+  end
+
+  def released_changelog(version, notes)
+    unreleased_section = changelog.match(/^## Unreleased\s*\n.*?(?=^## |\z)/m)
+    prefix = changelog[0...unreleased_section.begin(0)]
+    suffix = changelog[unreleased_section.end(0)..].strip
+    sections = ["## Unreleased", "## v#{version} (#{date})\n\n#{notes}"]
+    sections << suffix if !suffix.empty?
+
+    "#{prefix.rstrip}\n\n#{sections.join("\n\n")}\n"
+  end
+
+  def create_release_branch(version)
+    branch = "release/v#{version}"
+    existing_branch = git_output('show-ref', '--verify', "refs/heads/#{branch}", allow_failure: true)
+    raise ArgumentError, "The #{branch} branch already exists." if !existing_branch.empty?
+
+    git_output('switch', '-c', branch, 'main')
+
+    origin_main = git_output('rev-parse', '--verify', 'origin/main', allow_failure: true)
+    git_output('branch', '--set-upstream-to=origin/main') if !origin_main.empty?
+  end
+
+  def commit_release(version)
+    git_output('add', '--', CHANGELOG_FILENAME, VERSION_FILENAME)
+    git_output(
+      'commit',
+      '-m',
+      "[release] Prepare to release v#{version}",
+      '-m',
+      "Update `VERSION` to #{version} and archive the `Unreleased` entries in `CHANGELOG.md`.",
+    )
+  end
+
+  def git_output(*arguments, allow_failure: false)
+    output, error, status = Open3.capture3('git', *arguments, chdir: root_path)
+    return output if status.success? || allow_failure
+
+    raise ArgumentError, "Git failed: #{error.strip}"
+  end
+
+  def changelog
+    @changelog ||= File.read(changelog_path)
+  rescue Errno::ENOENT
+    raise ArgumentError, "#{CHANGELOG_FILENAME} does not exist."
+  end
+
+  def changelog_path
+    File.join(root_path, CHANGELOG_FILENAME)
+  end
+
+  def version_path
+    File.join(root_path, VERSION_FILENAME)
+  end
+end
+
+root_path = File.expand_path('..', __dir__)
+exit(PrepareRelease.new(root_path:, release_type: ARGV.fetch(0, nil)).run)
