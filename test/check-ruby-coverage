@@ -16,13 +16,14 @@ class CheckRubyCoverageTest
   def run
     test_complete_coverage
     test_incomplete_coverage
+    test_incomplete_coverage_in_github_actions
     test_missing_report
     test_malformed_report
     test_zero_valid_lines
     test_invalid_line_totals
 
     if failures.empty?
-      puts('6 tests passed.')
+      puts('7 tests passed.')
       return 0
     end
 
@@ -97,6 +98,26 @@ class CheckRubyCoverageTest
     end
   end
 
+  def test_incomplete_coverage_in_github_actions
+    result = run_checker(fixture('incomplete.xml'), github_actions: true)
+    stderr_lines = result[:stderr].lines
+    stop_command = stderr_lines.first.match(/\A::stop-commands::(?<token>check-ruby-coverage-[0-9a-f]{32})\n\z/)
+
+    assert('GitHub Actions output starts by stopping workflow commands') { !stop_command.nil? }
+    return if stop_command.nil?
+
+    assert_equal(
+      'GitHub Actions output resumes workflow commands after uncovered lines',
+      "::#{stop_command[:token]}::\n",
+      stderr_lines[-2],
+    )
+    assert_equal(
+      'GitHub Actions output reports the coverage failure after resuming workflow commands',
+      "Line coverage is not 100% (4/7 lines covered).\n",
+      stderr_lines.last,
+    )
+  end
+
   def test_malformed_report
     with_report('<coverage') do |report_path|
       result = run_checker(report_path)
@@ -137,10 +158,13 @@ class CheckRubyCoverageTest
     end
   end
 
-  def run_checker(coverage_report_path)
+  def run_checker(coverage_report_path, github_actions: false)
     Tempfile.create('github-step-summary') do |summary|
       stdout, stderr, status = Open3.capture3(
-        { 'GITHUB_STEP_SUMMARY' => summary.path },
+        {
+          'GITHUB_ACTIONS' => github_actions ? 'true' : nil,
+          'GITHUB_STEP_SUMMARY' => summary.path,
+        },
         RbConfig.ruby,
         CHECKER_PATH,
         coverage_report_path,
